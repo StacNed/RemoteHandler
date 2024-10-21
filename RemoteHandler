@@ -1,16 +1,47 @@
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local RemoteEventList = {}
+local RemoteFunctionList = {}
+
+-- Error handling and logging
+local function logError(message, isCritical)
+    local logMessage = "[RemoteHandler] Error: " .. message .. (RunService:IsClient() and " (Client)" or " (Server)")
+
+    if isCritical then
+        -- Use error to throw a critical error and halt execution
+        error(logMessage.."\n"..debug.traceback(), 2)
+    else
+        -- Use warn to log a non-critical error
+        warn(logMessage)
+    end
+end
 
 local RemoteHandler = {}
 
 -- Use a single folder for both events and functions to reduce Instance count
-local remoteFolder = ReplicatedStorage:FindFirstChild("RemoteHandlerFolder") or Instance.new("Folder")
-remoteFolder.Name = "RemoteHandlerFolder"
-remoteFolder.Parent = ReplicatedStorage
+local remoteFolder = ReplicatedStorage:WaitForChild("Remotes")
 
 -- Caches for faster lookups
 local eventCache = {}
 local functionCache = {}
 local validatorCache = {}
+
+-- Create remote functions and events from server
+if RunService:IsServer() then
+    --create remote events
+    for _, event in pairs(RemoteEventList) do
+        local remote = Instance.new("RemoteEvent")
+        remote.Name = event
+        remote.Parent = remoteFolder
+    end
+    --create remote functions
+    for _, event in pairs(RemoteFunctionList) do
+        local remote = Instance.new("RemoteEvent")
+        remote.Name = event
+        remote.Parent = remoteFolder
+    end
+end
 
 -- Sanity check system with optimized caching
 local SanityChecks = {
@@ -78,11 +109,6 @@ local SanityChecks = {
     }
 }
 
-function SanityChecks.addValidator(name, func)
-    SanityChecks.validators[name] = func
-    validatorCache[name] = setmetatable({}, {__mode = "k"}) -- Weak keys for garbage collection
-end
-
 function SanityChecks.validate(checkName, ...)
     local cache = validatorCache[checkName]
     if not cache then
@@ -100,7 +126,7 @@ function SanityChecks.validate(checkName, ...)
     if SanityChecks.validators[checkName] then
         result = SanityChecks.validators[checkName](...)
     else
-        warn("Validator '" .. checkName .. "' not found")
+        logError("Validator '" .. checkName .. "' not found")
     end
 
     cache[cacheKey] = result
@@ -115,40 +141,77 @@ function RemoteHandler.getOrCreateEvent(eventName)
 
     local event = remoteFolder:FindFirstChild(eventName)
     if not event then
-        event = Instance.new("RemoteEvent")
-        event.Name = eventName
-        event.Parent = remoteFolder
+        if RunService:IsServer() then
+            event = Instance.new("RemoteEvent")
+            event.Name = eventName
+            event.Parent = remoteFolder
+        else
+            return
+        end      
     end
-
+    
     eventCache[eventName] = event
     return event
 end
 
-function RemoteHandler.onServerEvent(eventName, callback, checks)
-    local event = RemoteHandler.getOrCreateEvent(eventName)
-    
-    event.OnServerEvent:Connect(function(player, ...)
-        if checks then
-            local args = {...}
-            for i, check in ipairs(checks) do
-                if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
-                    warn("Sanity check failed for event '" .. eventName .. "', argument " .. i)
-                    return
-                end
-            end
-        end
-        callback(player, ...)
-    end)
-end
-
+-- SERVER - CLIENT
 function RemoteHandler.fireClient(player, eventName, ...)
     local event = RemoteHandler.getOrCreateEvent(eventName)
-    event:FireClient(player, ...)
+    if event then
+        event:FireClient(player, ...)
+    else
+        logError(eventName.."has not been found")
+    end
 end
 
 function RemoteHandler.fireAllClients(eventName, ...)
     local event = RemoteHandler.getOrCreateEvent(eventName)
-    event:FireAllClients(...)
+    if event then
+        event:FireAllClients(...)
+    else
+        logError(eventName.."has not been found")
+    end
+    
+end
+
+function RemoteHandler.onClientEvent(eventName, callback)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    if event then
+        event.OnClientEvent:Connect(callback)
+    else
+        logError(eventName.."has not been found")
+    end  
+end
+
+-- CLIENT - SERVER
+
+function RemoteHandler.fireServer(eventName, ...)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    if event then
+        event:FireServer(...)
+    else
+        logError(eventName.."has not been found")
+    end   
+end
+
+function RemoteHandler.onServerEvent(eventName, callback, checks)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    if event then
+        event.OnServerEvent:Connect(function(player, ...)
+            if checks then
+                local args = {...}
+                for i, check in ipairs(checks) do
+                    if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
+                        logError("Sanity check failed for event '" .. eventName .. "', argument " .. i)
+                        return
+                    end
+                end
+            end
+            callback(player, ...)
+        end)
+    else
+        logError(eventName.."has not been found")
+    end 
 end
 
 -- RemoteFunction functions
@@ -159,66 +222,82 @@ function RemoteHandler.getOrCreateFunction(functionName)
 
     local func = remoteFolder:FindFirstChild(functionName)
     if not func then
-        func = Instance.new("RemoteFunction")
-        func.Name = functionName
-        func.Parent = remoteFolder
+        if RunService:IsServer() then
+            func = Instance.new("RemoteFunction")
+            func.Name = functionName
+            func.Parent = remoteFolder
+        else
+            return
+        end       
     end
 
     functionCache[functionName] = func
     return func
 end
 
-function RemoteHandler.setServerCallback(functionName, callback, checks)
+-- SERVER - CLIENT
+function RemoteHandler.invokeClient(player, functionName, resultChecks, ...)
     local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
-    
-    remoteFunc.OnServerInvoke = function(player, ...)
-        if checks then
-            local args = {...}
-            for i, check in ipairs(checks) do
-                if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
-                    warn("Sanity check failed for function '" .. functionName .. "', argument " .. i)
+    if remoteFunc then
+        -- Invoke the client and get the return value
+        local results = {remoteFunc:InvokeClient(player, ...)}
+        -- Perform checks on the return values
+        if resultChecks then
+            for i, check in ipairs(resultChecks) do
+                if not SanityChecks.validate(check.type, results[i], table.unpack(check.params or {})) then
+                    logError("Sanity check failed for client return value '" .. functionName .. "', value " .. i)
                     return nil
                 end
             end
         end
-        return callback(player, ...)
-    end
+        -- If all checks pass, return the results
+        return table.unpack(results)
+    else
+        -- If function not found then return nil
+        logError(functionName.."has not been found")
+        return
+    end  
 end
 
-function RemoteHandler.invokeClient(player, functionName, ...)
+function RemoteHandler.setClientCallback(functionName, callback)
     local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
-    return remoteFunc:InvokeClient(player, ...)
+    if remoteFunc then
+        remoteFunc.OnClientInvoke = callback
+    else
+        logError(functionName.."has not been found")
+    end 
 end
 
--- Client-side functions
-function RemoteHandler.fireServer(eventName, ...)
-    local event = RemoteHandler.getOrCreateEvent(eventName)
-    event:FireServer(...)
-end
-
+--CLIENT - SERVER
 function RemoteHandler.invokeServer(functionName, ...)
     local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
-    return remoteFunc:InvokeServer(...)
+    if remoteFunc then
+        return remoteFunc:InvokeServer(...)
+    else
+        -- If function not found then return nil
+        logError(functionName.."has not been found")
+        return
+    end 
 end
 
-function RemoteHandler.onClientEvent(eventName, callback)
-    local event = RemoteHandler.getOrCreateEvent(eventName)
-    event.OnClientEvent:Connect(callback)
-end
-
--- Utility functions
-function RemoteHandler.isServer()
-    return game:GetService("RunService"):IsServer()
-end
-
-function RemoteHandler.isClient()
-    return game:GetService("RunService"):IsClient()
-end
-
--- Error handling and logging
-local function logError(message)
-    warn("[RemoteHandler] Error: " .. message)
-    -- You could add more sophisticated error logging here, e.g., to a remote logging service
+function RemoteHandler.setServerCallback(functionName, callback, checks)
+    local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
+    if remoteFunc then
+        remoteFunc.OnServerInvoke = function(player, ...)
+            if checks then
+                local args = {...}
+                for i, check in ipairs(checks) do
+                    if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
+                        logError("Sanity check failed for function '" .. functionName .. "', argument " .. i)
+                        return nil
+                    end
+                end
+            end
+            return callback(player, ...)
+        end
+    else
+        logError(functionName.."has not been found")
+    end  
 end
 
 -- Batch processing for optimization
@@ -227,8 +306,5 @@ function RemoteHandler.batchFireAllClients(eventBatch)
         RemoteHandler.fireAllClients(eventName, table.unpack(eventData))
     end
 end
-
--- Add the SanityChecks to the public API for custom validators
-RemoteHandler.SanityChecks = SanityChecks
 
 return RemoteHandler
