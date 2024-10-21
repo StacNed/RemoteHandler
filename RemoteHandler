@@ -1,0 +1,234 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local RemoteHandler = {}
+
+-- Use a single folder for both events and functions to reduce Instance count
+local remoteFolder = ReplicatedStorage:FindFirstChild("RemoteHandlerFolder") or Instance.new("Folder")
+remoteFolder.Name = "RemoteHandlerFolder"
+remoteFolder.Parent = ReplicatedStorage
+
+-- Caches for faster lookups
+local eventCache = {}
+local functionCache = {}
+local validatorCache = {}
+
+-- Sanity check system with optimized caching
+local SanityChecks = {
+    validators = {
+        isNumber = function(value)
+            return type(value) == "number" and not (value ~= value)  -- Check for NaN
+        end,
+        isInteger = function(value)
+            return type(value) == "number" and not (value ~= value) and value % 1 == 0
+        end,
+        isString = function(value)
+            return type(value) == "string"
+        end,
+        isBoolean = function(value)
+            return type(value) == "boolean"
+        end,
+        isTable = function(value)
+            return type(value) == "table"
+        end,
+        isFunction = function(value)
+            return type(value) == "function"
+        end,
+        isUserdata = function(value)
+            return type(value) == "userdata"
+        end,
+        isThread = function(value)
+            return type(value) == "thread"
+        end,
+        isInRange = function(value, min, max)
+            return type(value) == "number" and not (value ~= value) and value >= min and value <= max
+        end,
+        isPositive = function(value)
+            return type(value) == "number" and not (value ~= value) and value > 0
+        end,
+        isNegative = function(value)
+            return type(value) == "number" and not (value ~= value) and value < 0
+        end,
+        isNonNegative = function(value)
+            return type(value) == "number" and not (value ~= value) and value >= 0
+        end,
+        isNonPositive = function(value)
+            return type(value) == "number" and not (value ~= value) and value <= 0
+        end,
+        isInstanceOf = function(value, className)
+            return typeof(value) == "Instance" and value:IsA(className)
+        end,
+        isVector3 = function(value)
+            return typeof(value) == "Vector3"
+        end,
+        isColor3 = function(value)
+            return typeof(value) == "Color3"
+        end,
+        isCFrame = function(value)
+            return typeof(value) == "CFrame"
+        end,
+        isEnum = function(value)
+            return typeof(value) == "EnumItem"
+        end,
+        isEnumOf = function(value, enumType)
+            return typeof(value) == "EnumItem" and value.EnumType == enumType
+        end,
+        matchesPattern = function(value, pattern)
+            return type(value) == "string" and string.match(value, pattern) ~= nil
+        end
+    }
+}
+
+function SanityChecks.addValidator(name, func)
+    SanityChecks.validators[name] = func
+    validatorCache[name] = setmetatable({}, {__mode = "k"}) -- Weak keys for garbage collection
+end
+
+function SanityChecks.validate(checkName, ...)
+    local cache = validatorCache[checkName]
+    if not cache then
+        cache = setmetatable({}, {__mode = "k"})
+        validatorCache[checkName] = cache
+    end
+
+    local args = {...}
+    local cacheKey = table.concat(args, "|")
+    if cache[cacheKey] ~= nil then
+        return cache[cacheKey]
+    end
+
+    local result = false
+    if SanityChecks.validators[checkName] then
+        result = SanityChecks.validators[checkName](...)
+    else
+        warn("Validator '" .. checkName .. "' not found")
+    end
+
+    cache[cacheKey] = result
+    return result
+end
+
+-- RemoteEvent functions
+function RemoteHandler.getOrCreateEvent(eventName)
+    if eventCache[eventName] then
+        return eventCache[eventName]
+    end
+
+    local event = remoteFolder:FindFirstChild(eventName)
+    if not event then
+        event = Instance.new("RemoteEvent")
+        event.Name = eventName
+        event.Parent = remoteFolder
+    end
+
+    eventCache[eventName] = event
+    return event
+end
+
+function RemoteHandler.onServerEvent(eventName, callback, checks)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    
+    event.OnServerEvent:Connect(function(player, ...)
+        if checks then
+            local args = {...}
+            for i, check in ipairs(checks) do
+                if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
+                    warn("Sanity check failed for event '" .. eventName .. "', argument " .. i)
+                    return
+                end
+            end
+        end
+        callback(player, ...)
+    end)
+end
+
+function RemoteHandler.fireClient(player, eventName, ...)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    event:FireClient(player, ...)
+end
+
+function RemoteHandler.fireAllClients(eventName, ...)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    event:FireAllClients(...)
+end
+
+-- RemoteFunction functions
+function RemoteHandler.getOrCreateFunction(functionName)
+    if functionCache[functionName] then
+        return functionCache[functionName]
+    end
+
+    local func = remoteFolder:FindFirstChild(functionName)
+    if not func then
+        func = Instance.new("RemoteFunction")
+        func.Name = functionName
+        func.Parent = remoteFolder
+    end
+
+    functionCache[functionName] = func
+    return func
+end
+
+function RemoteHandler.setServerCallback(functionName, callback, checks)
+    local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
+    
+    remoteFunc.OnServerInvoke = function(player, ...)
+        if checks then
+            local args = {...}
+            for i, check in ipairs(checks) do
+                if not SanityChecks.validate(check.type, args[i], table.unpack(check.params or {})) then
+                    warn("Sanity check failed for function '" .. functionName .. "', argument " .. i)
+                    return nil
+                end
+            end
+        end
+        return callback(player, ...)
+    end
+end
+
+function RemoteHandler.invokeClient(player, functionName, ...)
+    local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
+    return remoteFunc:InvokeClient(player, ...)
+end
+
+-- Client-side functions
+function RemoteHandler.fireServer(eventName, ...)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    event:FireServer(...)
+end
+
+function RemoteHandler.invokeServer(functionName, ...)
+    local remoteFunc = RemoteHandler.getOrCreateFunction(functionName)
+    return remoteFunc:InvokeServer(...)
+end
+
+function RemoteHandler.onClientEvent(eventName, callback)
+    local event = RemoteHandler.getOrCreateEvent(eventName)
+    event.OnClientEvent:Connect(callback)
+end
+
+-- Utility functions
+function RemoteHandler.isServer()
+    return game:GetService("RunService"):IsServer()
+end
+
+function RemoteHandler.isClient()
+    return game:GetService("RunService"):IsClient()
+end
+
+-- Error handling and logging
+local function logError(message)
+    warn("[RemoteHandler] Error: " .. message)
+    -- You could add more sophisticated error logging here, e.g., to a remote logging service
+end
+
+-- Batch processing for optimization
+function RemoteHandler.batchFireAllClients(eventBatch)
+    for eventName, eventData in pairs(eventBatch) do
+        RemoteHandler.fireAllClients(eventName, table.unpack(eventData))
+    end
+end
+
+-- Add the SanityChecks to the public API for custom validators
+RemoteHandler.SanityChecks = SanityChecks
+
+return RemoteHandler
